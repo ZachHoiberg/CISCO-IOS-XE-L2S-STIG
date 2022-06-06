@@ -1,0 +1,333 @@
+---
+- name: Cisco IOS-XE Switch L2S STIG Config
+  hosts: all
+  gather_facts: True
+  vars_files: secrets/secrets.yml
+  tasks:
+
+    - name: Create the lists from secrets
+      set_fact: 
+        radiusServerIPList: "{{radiusServerIPs.split('\n')}}"
+        userVlansList: "{{userVlans.split('\n')}}"
+        radiusServerNamesList: "{{radiusServerNames.split('\n')}}"
+        distributionSwitchesList: "{{distributionSwitches.split('\n')}}"
+
+    - name: Getting interface facts
+      ios_facts:
+        gather_subset: all
+        gather_network_resources: 
+          - l2_interfaces
+          - l3_interfaces
+
+    - name: Grabbing full running config for hidden defaults
+      ios_command:
+        commands: show running-config all
+      register: running_config
+
+    - name: CISC-L2-000010 - Disabling unneccesary services (1/8)
+      ios_config:
+        lines:
+        - no ip finger
+        - no ip http server
+        - no service config
+        - no service pad
+        running_config: "{{running_config.stdout[0]}}"
+
+    - name: CISC-L2-000010 - Disabling unneccesary services (2/8)
+      ios_config:
+        lines:
+        - no ip rcmd rsh-enable
+        running_config: "{{running_config.stdout[0]}}"
+      when: '"ip rcmd rsh-enable" in running_config.stdout[0]'
+
+    - name: CISC-L2-000010 - Disabling unneccesary services (3/8)
+      ios_config:
+        lines:
+        - no service finger
+        running_config: "{{running_config.stdout[0]}}"
+      when: '"service finger" in running_config.stdout[0]'
+
+    - name: CISC-L2-000010 - Disabling unneccesary services (4/8)
+      ios_config:
+        lines:
+        - no service tcp-small-servers
+        running_config: "{{running_config.stdout[0]}}"
+      when: '"service tcp-small-servers" in running_config.stdout[0]'
+
+    - name: CISC-L2-000010 - Disabling unneccesary services (5/8)
+      ios_config:
+        lines:
+        - no service udp-small-servers
+        running_config: "{{running_config.stdout[0]}}"
+      when: '"service udp-small-servers" in running_config.stdout[0]'
+
+    - name: CISC-L2-000010 - Disabling unneccesary services (6/8)
+      ios_config:
+        lines:
+        - no ip rcmd rcp-enable
+        running_config: "{{running_config.stdout[0]}}"
+      when: '"ip rcmd rcp-enable" in running_config.stdout[0]'
+
+    - name: CISC-L2-000010 - Disabling unneccesary services (7/8)
+      ios_config:
+        lines:
+        - no ip boot server
+        running_config: "{{running_config.stdout[0]}}"
+      when: '"ip boot server" in running_config.stdout[0]'
+
+    - name: CISC-L2-000010 - Disabling unneccesary services (8/8)
+      ios_config:
+        lines:
+        - no ip bootp server
+        running_config: "{{running_config.stdout[0]}}"
+      when: '"ip bootp server" in running_config.stdout[0]'
+
+    - name: CISC-L2-000020 & CISC-L2-000080 - Uniquely identify and authenticate with 802.1x - Global Config
+      ios_config:
+        lines:
+        - address ipv4 {{item}} auth-port 1812 acct-port 1813
+        - key 0 {{radiusKey}}
+        parents: radius server {{radiusServerNamesList[my_idx]}}
+      loop: "{{radiusServerIPList}}"
+      loop_control:
+        index_var: my_idx
+        
+    - name: Grabbing running config to speed up loops
+      ios_command:
+        commands: show running-config
+      register: running_config
+
+    - name: CISC-L2-000020 & CISC-L2-000080 - Uniquely identify and authenticate with 802.1x - Port Config
+      ios_config:
+        lines:
+        - authentication event fail action authorize vlan {{guestVlan}}
+        - authentication event no-response action authorize {{guestVlan}}
+        - authentication port-control auto
+        - authentication periodic
+        - authentication timer reauthenticate 30
+        - authentication violation replace
+        - dot1x pae authenticator
+        - dot1x timeout tx-period 3
+        parents: "interface {{item.name}}"
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: 'item.mode is defined and item.mode == "access" and item.access.vlan in userVlansList'
+  
+    - name: CISC-L2-000030 - Enable VTP Password
+      ios_config:
+        lines:
+        - vtp password {{vtpPassword}}
+
+    - name: CISC-L2-000040 - Enable QOS - Access
+      include_tasks: qos_access_block.yml
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "access"
+
+    - name: CISC-L2-000040 - Enable QOS - Trunk
+      include_tasks: qos_trunk_block.yml
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "trunk"
+
+# IOS-XE Switches can do this from the web panel, no config needed. Switch has capability to do so manually if needed.
+#    - name: CISC-L2-000060 & CISC-L2-000070 - Enable historic and real-time interface monitoring
+
+    - name: CISC-L2-000090 - Enable Root Guard on all switchports connecting to access layer switches - Access Ports
+      ios_config: 
+        lines:
+          - spanning-tree guard root
+        parents: "interface {{item.name}}"
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "access"
+
+    - name: CISC-L2-000090 - Enable Root Guard on all switchports connecting to access layer switches - Trunk Ports
+      ios_config: 
+        lines:
+          - spanning-tree guard root
+        parents: "interface {{item.name}}"
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: 'item.mode is defined and item.mode == "trunk" and not "{{ansible_net_hostname}}" in distributionSwitchesList and (ansible_net_interfaces["{{item.name}}"].description is none or not "UpLink" in ansible_net_interfaces["{{item.name}}"].description)'
+
+    - name: CISC-L2-000100 - Enable BDPU Guard on all host-facing ports
+      ios_config:
+        lines:
+        - spanning-tree bpduguard enable
+        parents: "interface {{ item.name }}"
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "access"
+
+    - name: CISC-L2-000110 - Enable STP Loop Guard
+      ios_config:
+        lines:
+        - spanning-tree loopguard default
+
+    - name: CISC-L2-000120 - Enable Unknown Unicast Flood Blocking
+      ios_config:
+        lines:
+        - switchport block unicast
+        parents: "interface {{item.name}}"
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "access"
+      
+#Needs further testing
+#    - name: CISC-L2-000130 - Enable DHCP snooping for all user VLANs (1/2)
+#      ios_config:
+#        lines:
+#        - ip dhcp snooping vlan {{item}}
+#      when: '"{{ansible_net_hostname}}" in vtpServerHostname and userVlansList[0] != userVlansList[-1] and item != ""'
+#      loop: "{{userVlansList}}"
+
+#    - name: CISC-L2-000130 - Enable DHCP snooping for all user VLANs (2/2)
+#      ios_config:
+#        lines:
+#        - ip dhcp snooping vlan {{item}}
+#      when: '"{{ansible_net_hostname}}" in vtpServerHostname and userVlansList[0] == userVlansList[-1] and item != ""'
+#      loop: "{{userVlansList}}"
+
+    - name: CISC-L2-000140 - Enable IP Source Guard for user-facing ports
+      ios_config:
+        lines:
+        - ip verify source
+        parents: "interface {{item.name}}"
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "access"
+      
+#Needs further testing
+#    - name: CISC-L2-000150 - Enable Dynamic Address Resolution Protocol Inspection on all user VLANs (1/2)
+#      ios_config:
+#        lines:
+#        - ip arp inspection vlan {{item}}
+#      when: '"{{ansible_net_hostname}}" in vtpServerHostname and userVlansList[0] != userVlansList[-1] and item != ""'
+#      loop: "{{userVlansList}}"
+#
+#    - name: CISC-L2-000150 - Enable Dynamic Address Resolution Protocol Inspection on all user VLANs (2/2)
+#      ios_config:
+#        lines:
+#        - ip arp inspection vlan {{item}}
+#      when: '"{{ansible_net_hostname}}" in vtpServerHostname and userVlansList[0] == userVlansList[-1] and item != ""'
+#      loop: "{{userVlansList}}"
+
+    - name: CISC-L2-000160 - Enable Storm Control on GigabitEthernet host-facing ports
+      ios_config:
+        lines:
+        - storm-control unicast level pps 100k 
+        - storm-control broadcast level pps 500
+        parents: "interface {{item.name}}"
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "access" and "GigabitEthernet" in item.name
+
+    - name: CISC-L2-000170 - Enable IGMP Snooping
+      ios_config:
+        lines:
+        - ip igmp snooping
+        running_config: "{{running_config.stdout[0]}}"
+      when: '"no ip igmp snooping" in running_config.stdout[0]'
+
+    - name: CISC-L2-000180 - Enable Rapid STP where VLANs span multiple switches with redundant links
+      ios_config:
+        lines:
+        - spanning-tree mode rapid-pvst
+
+    - name: CISC-L2-000190 - Enable Unidirectional Link Detection to protect against one-way connections
+      ios_config:
+        lines:
+        - udld enable
+
+    - name: Grabbing running config to speed up loops
+      ios_command:
+        commands: show running-config
+      register: running_config
+
+    - name: CISC-L2-000200 - Enable trunk links statically (1/2)
+      ios_config:
+        lines:
+        - switchport nonegotiate
+        parents: interface {{item.name}}
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "trunk"
+      
+    - name: CISC-L2-000200 - Enable trunk links statically (2/2)
+      ios_config:
+        lines:
+        - no switchport access vlan
+        parents: interface {{item.name}}
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "trunk" and item.access.vlan is defined
+
+#Not needed with 802.1X
+#    - name: CISC-L2-000210 - Set non-active switchports to use an inactive VLAN
+
+    - name: Grabbing running config to speed up loops
+      ios_command:
+        commands: show running-config
+      register: running_config
+
+    - name: CISC-L2-000220 - Remove default VLAN assignments
+      ios_config:
+        lines:
+        - switchport access vlan {{inactiveVLAN}}
+        parents: interface {{item.name}}
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      loop_control:
+        index_var: my_idx
+      when: item.access.vlan is not defined and not item.name == "FastEthernet0" and not item.name == "GigabitEthernet0/0" and (item.mode is not defined or item.mode == "access") and ansible_network_resources.l3_interfaces[my_idx].ipv4 is not defined
+
+    - name: Grabbing running config to speed up loops
+      ios_command:
+        commands: show running-config
+      register: running_config
+
+    - name: CISC-L2-000230 - Prune default VLAN from trunk links that don't need it
+      ios_config:
+        lines:
+        - switchport trunk allowed vlan remove 1,{{nativeVLAN}}
+        parents: interface {{item.name}}
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "trunk"
+
+#Done manually per switch
+#    - name: CISC-L2-000240 - Configure the management VLAN to use a VLAN other than the default VLAN
+#      ios_config:
+#        lines:
+#        - int vlan Y
+#        - ip add 10.1.Y.X 255.255.255.0
+#        - no shut
+
+    - name: CISC-L2-000250 - Disable trunking on all user-facing ports
+      ios_l2_interfaces:
+        config: 
+        - name: "{{item.name}}"
+          mode: access
+        state: merged
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is not defined and not item.name == "FastEthernet0" and not item.name == "GigabitEthernet0/0" and ansible_network_resources.l3_interfaces[my_idx].ipv4 is not defined
+
+    - name: Grabbing running config to speed up loops
+      ios_command:
+        commands: show running-config
+      register: running_config
+
+    - name: CISC-L2-000260 - Use the non default vlan for trunk ports (1/2)
+      ios_config:
+        lines:
+        - switchport trunk native vlan {{nativeVLAN}}
+        parents: "interface {{item.name}}"
+        running_config: "{{running_config.stdout[0]}}"
+      loop: "{{ansible_network_resources.l2_interfaces}}"
+      when: item.mode is defined and item.mode == "trunk" and (item.trunk.native_vlan is not defined or not item.trunk.native_vlan == {{nativeVLAN}}) and ansible_net_interfaces['{{item.name}}'].description is not none and ("UpLink to" in ansible_net_interfaces['{{item.name}}'].description or "DownLink to" in ansible_net_interfaces['{{item.name}}'].description)
+
+    - name: CISC-L2-000270 - Do not use the default VLAN on any switch ports
+      ios_config:
+        lines:
+        - no ip address
+        - shutdown
+        parents: interface Vlan1
